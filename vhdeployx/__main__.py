@@ -1,7 +1,5 @@
 """Entry point for VHDeployX."""
 
-import sys
-
 
 def main():
     from vhdeployx.app import VHDeployXApp

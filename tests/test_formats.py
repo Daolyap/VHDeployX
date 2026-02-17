@@ -1,7 +1,5 @@
 """Tests for vhdeployx.formats – format detection, validation, and metadata."""
 
-import io
-import struct
 import tempfile
 from pathlib import Path
 
