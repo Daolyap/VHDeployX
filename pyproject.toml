@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "VHDeployX"
+version = "1.0.0"
+description = "Deploy VHDX, VHD, WIM, ISO, and IMG disk images to physical disks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["deployment", "disk-image", "vhdx", "wim", "iso"]
+
+[project.scripts]
+vhdeployx = "vhdeployx.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["vhdeployx*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
