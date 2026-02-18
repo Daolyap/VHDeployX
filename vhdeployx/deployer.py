@@ -14,7 +14,6 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Callable
 
 from vhdeployx.disk import DiskInfo, clean_disk
@@ -44,16 +43,19 @@ class Deployer:
 
     def __init__(self) -> None:
         self._cancel = threading.Event()
+        self._lock = threading.Lock()
         self._status = DeploymentStatus.IDLE
         self._thread: threading.Thread | None = None
 
     @property
     def status(self) -> DeploymentStatus:
-        return self._status
+        with self._lock:
+            return self._status
 
     @property
     def is_running(self) -> bool:
-        return self._status == DeploymentStatus.RUNNING
+        with self._lock:
+            return self._status == DeploymentStatus.RUNNING
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -74,7 +76,8 @@ class Deployer:
         if self.is_running:
             raise RuntimeError("A deployment is already in progress")
         self._cancel.clear()
-        self._status = DeploymentStatus.RUNNING
+        with self._lock:
+            self._status = DeploymentStatus.RUNNING
         self._thread = threading.Thread(
             target=self._run,
             args=(image, target_disk, progress_cb),
@@ -98,7 +101,8 @@ class Deployer:
 
             _progress(5, f"Cleaning disk {target_disk.index}…")
             if self._cancel.is_set():
-                self._status = DeploymentStatus.CANCELLED
+                with self._lock:
+                    self._status = DeploymentStatus.CANCELLED
                 _progress(0, "Cancelled")
                 return
             clean_disk(target_disk.index)
@@ -107,18 +111,21 @@ class Deployer:
             _prepare_disk(target_disk.index, image.format)
 
             if self._cancel.is_set():
-                self._status = DeploymentStatus.CANCELLED
+                with self._lock:
+                    self._status = DeploymentStatus.CANCELLED
                 _progress(0, "Cancelled")
                 return
 
             _progress(20, f"Deploying {image.format.value.upper()} image…")
             _deploy_image(image, target_disk.index, _progress)
 
-            self._status = DeploymentStatus.SUCCESS
+            with self._lock:
+                self._status = DeploymentStatus.SUCCESS
             _progress(100, "Deployment completed successfully")
         except Exception as exc:
             logger.exception("Deployment failed")
-            self._status = DeploymentStatus.FAILED
+            with self._lock:
+                self._status = DeploymentStatus.FAILED
             _progress(0, f"Error: {exc}")
 
 
@@ -129,6 +136,38 @@ def _ensure_windows() -> None:
     if platform.system() != "Windows":
         raise RuntimeError(
             "Image deployment requires Windows (DISM / diskpart)"
+        )
+
+
+def _escape_ps_path(path: object) -> str:
+    """Escape a path for use in a PowerShell single-quoted string."""
+    return str(path).replace("'", "''")
+
+
+def _run_robocopy_ps(ps_command: str, *, timeout: int = 3600) -> None:
+    """Run a PowerShell command that uses robocopy, with proper exit code handling.
+
+    Robocopy exit codes 0-7 indicate success; 8+ indicate failure.
+    """
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_command],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode is not None and result.returncode >= 8:
+        logger.error(
+            "PowerShell/robocopy exited with code %s. stdout=%s stderr=%s",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
+        raise subprocess.CalledProcessError(
+            returncode=result.returncode,
+            cmd=result.args,
+            output=result.stdout,
+            stderr=result.stderr,
         )
 
 
@@ -225,28 +264,29 @@ def _deploy_vhd(
 ) -> None:
     """Expand a VHD/VHDX to a physical disk via PowerShell."""
     progress(30, "Mounting VHD image…")
+    vhd_path = _escape_ps_path(image.path)
     ps = (
-        f"$vhd = Mount-VHD -Path '{image.path}' -PassThru -ReadOnly; "
+        f"$vhdPath = '{vhd_path}'; "
+        "$ErrorActionPreference = 'Stop'; "
+        "try { "
+        "$vhd = Mount-VHD -Path $vhdPath -PassThru -ReadOnly; "
         "$disk = $vhd | Get-Disk; "
-        "$parts = $disk | Get-Partition | Where-Object {{ $_.Type -ne 'Reserved' }}; "
-        "foreach ($p in $parts) {{ "
-        "  if ($p.AccessPaths -and $p.AccessPaths.Count -gt 0) {{ "
+        "$parts = $disk | Get-Partition | Where-Object { $_.Type -ne 'Reserved' }; "
+        "foreach ($p in $parts) { "
+        "  if ($p.AccessPaths -and $p.AccessPaths.Count -gt 0) { "
         "    $vol = $p | Get-Volume; "
-        "    if ($vol.FileSystemType -eq 'NTFS') {{ "
-        f"      $src = $p.AccessPaths[0]; "
+        "    if ($vol.FileSystemType -eq 'NTFS') { "
+        "      $src = $p.AccessPaths[0]; "
         "      robocopy $src W:\\ /E /COPYALL /DCOPY:DAT /R:1 /W:1; "
-        "    }} "
-        "  }} "
-        "}}; "
-        f"Dismount-VHD -Path '{image.path}'"
+        "      if ($LASTEXITCODE -ge 8) { throw \"robocopy failed with exit code $LASTEXITCODE\" } "
+        "    } "
+        "  } "
+        "} "
+        "} finally { "
+        "Dismount-VHD -Path $vhdPath "
+        "}"
     )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", ps],
-        capture_output=True,
-        text=True,
-        timeout=3600,
-        check=True,
-    )
+    _run_robocopy_ps(ps)
     progress(80, "Creating boot files…")
     subprocess.run(
         ["bcdboot", "W:\\Windows", "/s", "S:", "/f", "UEFI"],
@@ -263,28 +303,35 @@ def _deploy_iso(
 ) -> None:
     """Mount an ISO and copy contents (typically a Windows install media)."""
     progress(30, "Mounting ISO…")
+    iso_path = _escape_ps_path(image.path)
     ps = (
-        f"$iso = Mount-DiskImage -ImagePath '{image.path}' -PassThru; "
+        f"$isoPath = '{iso_path}'; "
+        "$ErrorActionPreference = 'Stop'; "
+        "try { "
+        "$iso = Mount-DiskImage -ImagePath $isoPath -PassThru; "
         "$drive = ($iso | Get-Volume).DriveLetter; "
-        "$src = \"${drive}:\\\"; "
+        '$src = "${drive}:\\"; '
         "robocopy $src W:\\ /E /R:1 /W:1; "
-        f"Dismount-DiskImage -ImagePath '{image.path}'"
+        "$robocopyExit = $LASTEXITCODE; "
+        "} finally { "
+        "Dismount-DiskImage -ImagePath $isoPath "
+        "}; "
+        "if ($robocopyExit -ge 8) { exit $robocopyExit } else { exit 0 }"
     )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", ps],
-        capture_output=True,
-        text=True,
-        timeout=3600,
-        check=True,
-    )
+    _run_robocopy_ps(ps)
     progress(80, "Setting up boot configuration…")
-    # If there's a WIM inside the ISO, apply it instead
-    subprocess.run(
-        ["bcdboot", "W:\\Windows", "/s", "S:", "/f", "UEFI"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        subprocess.run(
+            ["bcdboot", "W:\\Windows", "/s", "S:", "/f", "UEFI"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        logger.warning(
+            "bcdboot failed – the ISO may not contain a bootable Windows installation"
+        )
     progress(95, "ISO deployment complete")
 
 
@@ -293,15 +340,19 @@ def _deploy_img(
 ) -> None:
     """Write a raw IMG file directly to the disk using PowerShell streams."""
     progress(30, "Writing raw image to disk…")
-    # Use dd-like raw write via PowerShell
+    img_path = _escape_ps_path(image.path)
     ps = (
-        f"$src = [System.IO.File]::OpenRead('{image.path}'); "
+        "$ErrorActionPreference = 'Stop'; "
+        f"$src = [System.IO.File]::OpenRead('{img_path}'); "
+        "try { "
         f"$dst = [System.IO.File]::OpenWrite('\\\\.\\PhysicalDrive{disk_index}'); "
+        "try { "
         "$buf = New-Object byte[] (1MB); "
-        "while (($n = $src.Read($buf, 0, $buf.Length)) -gt 0) {{ "
+        "while (($n = $src.Read($buf, 0, $buf.Length)) -gt 0) { "
         "  $dst.Write($buf, 0, $n) "
-        "}}; "
-        "$src.Close(); $dst.Close()"
+        "} "
+        "} finally { $dst.Dispose() } "
+        "} finally { $src.Dispose() }"
     )
     subprocess.run(
         ["powershell", "-NoProfile", "-Command", ps],

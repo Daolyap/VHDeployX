@@ -1,15 +1,19 @@
 """Disk enumeration and management helpers.
 
 On Windows the module shells out to PowerShell / diskpart.  On other
-platforms it provides stub data so the GUI can still be developed and tested.
+platforms it returns an empty list of disks so the application can still run
+without performing any disk operations.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import platform
 import subprocess
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -58,6 +62,11 @@ def _list_disks_windows() -> list[DiskInfo]:
             timeout=30,
         )
         if result.returncode != 0:
+            logger.warning(
+                "PowerShell Get-Disk failed (exit %s): %s",
+                result.returncode,
+                result.stderr,
+            )
             return []
         data = json.loads(result.stdout)
         if isinstance(data, dict):
@@ -76,7 +85,8 @@ def _list_disks_windows() -> list[DiskInfo]:
                 )
             )
         return disks
-    except Exception:
+    except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.exception("Failed to enumerate disks: %s", exc)
         return []
 
 
@@ -88,16 +98,28 @@ def _list_disks_stub() -> list[DiskInfo]:
 def clean_disk(disk_index: int) -> subprocess.CompletedProcess[str]:
     """Run diskpart ``clean`` on the specified disk (Windows only).
 
-    Raises ``RuntimeError`` on non-Windows systems.
+    Raises ``RuntimeError`` on non-Windows systems or if diskpart fails.
     """
     if platform.system() != "Windows":
         raise RuntimeError("Disk cleaning is only supported on Windows")
 
     script = f"select disk {disk_index}\nclean\n"
-    return subprocess.run(
-        ["diskpart"],
-        input=script,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    try:
+        result = subprocess.run(
+            ["diskpart"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        message = (
+            f"diskpart clean failed for disk {disk_index} "
+            f"with exit code {exc.returncode}.\n"
+            f"STDOUT:\n{exc.stdout}\n"
+            f"STDERR:\n{exc.stderr}"
+        )
+        raise RuntimeError(message) from exc
+
+    return result

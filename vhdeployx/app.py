@@ -12,7 +12,6 @@ from vhdeployx.deployer import Deployer, DeploymentStatus
 from vhdeployx.disk import DiskInfo, list_disks
 from vhdeployx.formats import (
     FORMAT_DESCRIPTIONS,
-    ImageFormat,
     ImageInfo,
     get_image_info,
     supported_extensions,
@@ -155,6 +154,7 @@ class VHDeployXApp(tk.Tk):
         try:
             info = get_image_info(path)
         except (ValueError, FileNotFoundError) as exc:
+            logger.exception("Failed to load image from path %r", path)
             messagebox.showerror("Error", str(exc))
             return
 
@@ -194,6 +194,12 @@ class VHDeployXApp(tk.Tk):
     def _start_deploy(self) -> None:
         if self._image_info is None:
             messagebox.showwarning("Warning", "Please select a source image first.")
+            return
+        if not self._image_info.path.exists():
+            messagebox.showerror(
+                "Error",
+                f"Image file no longer exists:\n{self._image_info.path}",
+            )
             return
         idx = self._disk_combo.current()
         if idx < 0 or idx >= len(self._disks):
