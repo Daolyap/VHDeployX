@@ -140,7 +140,11 @@ def _ensure_windows() -> None:
 
 
 def _escape_ps_path(path: object) -> str:
-    """Escape a path for use in a PowerShell single-quoted string."""
+    """Escape a path for use in a PowerShell single-quoted string literal.
+
+    Only safe for direct interpolation into ``'...'`` strings; do not use
+    within double-quoted or expandable PowerShell contexts.
+    """
     return str(path).replace("'", "''")
 
 
@@ -156,7 +160,7 @@ def _run_robocopy_ps(ps_command: str, *, timeout: int = 3600) -> None:
         timeout=timeout,
         check=False,
     )
-    if result.returncode is not None and result.returncode >= 8:
+    if result.returncode >= 8:
         logger.error(
             "PowerShell/robocopy exited with code %s. stdout=%s stderr=%s",
             result.returncode,
